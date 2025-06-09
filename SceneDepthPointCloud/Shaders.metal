@@ -1,5 +1,5 @@
 /*
-See LICENSE folder for this sample’s licensing information.
+See LICENSE folder for this sample's licensing information.
 
 Abstract:
 The sample app's shaders.
@@ -128,5 +128,6 @@ fragment float4 particleFragment(ParticleVertexOut in [[stage_in]],
         discard_fragment();
     }
     
-    return in.color;
+    // Make points green and semi-transparent
+    return float4(0.0, 1.0, 0.0, 0.5);
 }

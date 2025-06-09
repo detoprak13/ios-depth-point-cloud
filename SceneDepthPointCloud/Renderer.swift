@@ -1,5 +1,5 @@
 /*
- See LICENSE folder for this sample’s licensing information.
+ See LICENSE folder for this sample's licensing information.
  
  Abstract:
  The host app renderer.
@@ -23,7 +23,7 @@ final class Renderer {
     public weak var delegate: TaskDelegate?
     
     // Maximum number of points we store in the point cloud
-    private let maxPoints = 500_000
+    private let maxPoints = 4_000_000
     // Number of sample points on the grid
     private let numGridPoints = 500
     // Particle's size in pixels
@@ -107,7 +107,7 @@ final class Renderer {
         }
     }
     
-    var rgbRadius: Float = 0 {
+    var rgbRadius: Float = 1.0 {
         didSet {
             // apply the change for the shader
             rgbUniforms.radius = rgbRadius
