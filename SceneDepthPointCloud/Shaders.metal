@@ -22,6 +22,7 @@ struct ParticleVertexOut {
     float4 position [[position]];
     float pointSize [[point_size]];
     float4 color;
+    float confidence;
 };
 
 constexpr sampler colorSampler(mip_filter::linear, mag_filter::linear, min_filter::linear);
@@ -116,7 +117,7 @@ vertex ParticleVertexOut particleVertex(uint vertexID [[vertex_id]],
     out.position = projectedPosition;
     out.pointSize = pointSize;
     out.color = float4(sampledColor, visibility);
-    
+    out.confidence = confidence;
     return out;
 }
 
@@ -127,7 +128,15 @@ fragment float4 particleFragment(ParticleVertexOut in [[stage_in]],
     if (in.color.a == 0 || distSquared > 0.25) {
         discard_fragment();
     }
-    
-    // Make points green and semi-transparent
-    return float4(0.0, 1.0, 0.0, 0.5);
+    // Use confidence to determine color
+    // confidence: 2 = high (green), 1 = medium (yellow), 0 = low (discard)
+    if (in.confidence < 1.0) {
+        discard_fragment(); // low confidence
+    } else if (in.confidence < 2.0) {
+        // medium confidence: yellow
+        return float4(1.0, 1.0, 0.0, 0.5);
+    } else {
+        // high confidence: green
+        return float4(0.0, 1.0, 0.0, 0.5);
+    }
 }
