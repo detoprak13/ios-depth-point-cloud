@@ -140,3 +140,41 @@ fragment float4 particleFragment(ParticleVertexOut in [[stage_in]],
         return float4(0.0, 1.0, 0.0, 0.5);
     }
 }
+
+// MARK: - Mesh rendering
+
+struct MeshVertexOut {
+    float4 position [[position]];
+    float3 color;
+    float2 texCoord; // screen-space UV mapped to camera
+};
+
+vertex MeshVertexOut meshVertex(uint vertexID [[vertex_id]],
+                                constant MeshUniforms &uniforms [[buffer(kMeshUniforms)]],
+                                const device float3 *positions [[buffer(1)]]) {
+    MeshVertexOut out;
+    const float3 pos = positions[vertexID];
+    float4 world = uniforms.modelMatrix * float4(pos, 1.0);
+    float4 clip = uniforms.viewProjectionMatrix * world;
+    out.position = clip;
+    float2 view01 = (clip.xy / max(clip.w, 1e-6)) * float2(0.5, -0.5) + float2(0.5, 0.5);
+    // map to camera texcoords using the same transform as RGB path
+    float3 cam = float3(view01, 1) * uniforms.viewToCamera;
+    out.texCoord = cam.xy;
+    out.color = float3(1.0, 1.0, 1.0);
+    return out;
+}
+
+fragment float4 meshFragment(MeshVertexOut in [[stage_in]],
+                             texture2d<unsigned int, access::sample> confidenceTexture [[texture(kTextureConfidence)]]) {
+    constexpr sampler s(mip_filter::nearest, mag_filter::nearest, min_filter::nearest, address::clamp_to_edge);
+    float2 uv = in.texCoord;
+    float conf = confidenceTexture.sample(s, uv).r;
+    // Map: 0=discard, 1=yellow, 2=green
+    if (conf < 1.0) discard_fragment();
+    float3 low = float3(1.0, 1.0, 0.0);
+    float3 high = float3(0.0, 1.0, 0.0);
+    float t = saturate((conf - 1.0) / 1.0);
+    float3 col = mix(low, high, t);
+    return float4(col, 0.6);
+}

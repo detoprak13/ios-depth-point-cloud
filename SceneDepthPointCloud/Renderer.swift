@@ -49,6 +49,7 @@ final class Renderer {
     private lazy var unprojectPipelineState = makeUnprojectionPipelineState()!
     private lazy var rgbPipelineState = makeRGBPipelineState()!
     private lazy var particlePipelineState = makeParticlePipelineState()!
+    private lazy var meshPipelineState = makeMeshPipelineState()!
     // texture cache for captured image
     private lazy var textureCache = makeTextureCache()
     private var capturedImageTextureY: CVMetalTexture?
@@ -87,11 +88,28 @@ final class Renderer {
         return uniforms
     }()
     private var pointCloudUniformsBuffers = [MetalBuffer<PointCloudUniforms>]()
+    private var meshUniformsBuffers = [MetalBuffer<MeshUniforms>]()
     // Particles buffer
     // Saves the point cloud data, filled by unprojectVertex func in Shaders.metal
     private var particlesBuffer: MetalBuffer<ParticleUniforms>
     private var currentPointIndex = 0
     private var currentPointCount = 0
+
+    // Mesh storage per ARMeshAnchor
+    private struct MeshBuffers {
+        let vertexBuffer: MTLBuffer
+        let indexBuffer: MTLBuffer
+        let indexCount: Int
+        let indexType: MTLIndexType
+        let modelMatrix: simd_float4x4
+    }
+    private var meshesById: [UUID: MeshBuffers] = [:]
+    private let meshQueue = DispatchQueue(label: "SceneDepthPointCloud.Renderer.meshQueue", attributes: .concurrent)
+    
+    // World stabilization to mitigate ARKit world rebases
+    private var stabilizationTransform = matrix_identity_float4x4
+    private var lastRawCameraTransformForStabilization: simd_float4x4?
+    private var wasTrackingNormal = true
     
     // Camera data
     private var sampleFrame: ARFrame { session.currentFrame! }
@@ -126,6 +144,7 @@ final class Renderer {
         for _ in 0 ..< maxInFlightBuffers {
             rgbUniformsBuffers.append(.init(device: device, count: 1, index: 0))
             pointCloudUniformsBuffers.append(.init(device: device, count: 1, index: kPointCloudUniforms.rawValue))
+            meshUniformsBuffers.append(.init(device: device, count: 1, index: kMeshUniforms.rawValue))
         }
         particlesBuffer = .init(device: device, count: maxPoints, index: kParticleUniforms.rawValue)
         
@@ -176,8 +195,9 @@ final class Renderer {
         let viewMatrix = camera.viewMatrix(for: orientation)
         let viewMatrixInversed = viewMatrix.inverse
         let projectionMatrix = camera.projectionMatrix(for: orientation, viewportSize: viewportSize, zNear: 0.001, zFar: 0)
-        pointCloudUniforms.viewProjectionMatrix = projectionMatrix * viewMatrix
-        pointCloudUniforms.localToWorld = viewMatrixInversed * rotateToARCamera
+        // Apply stabilization: viewProjection uses inverse(stabilization), world transforms use stabilization
+        pointCloudUniforms.viewProjectionMatrix = projectionMatrix * viewMatrix * simd_inverse(stabilizationTransform)
+        pointCloudUniforms.localToWorld = stabilizationTransform * (viewMatrixInversed * rotateToARCamera)
         pointCloudUniforms.cameraIntrinsicsInversed = cameraIntrinsicsInversed
     }
     
@@ -196,9 +216,34 @@ final class Renderer {
             }
         }
         
-        // update frame data
+        // update stabilization based on tracking state transitions or large pose jumps
+        let isTrackingNormal: Bool
+        switch currentFrame.camera.trackingState {
+        case .normal:
+            isTrackingNormal = true
+        default:
+            isTrackingNormal = false
+        }
+        let currentRawCam = currentFrame.camera.transform
+        if let lastCam = lastRawCameraTransformForStabilization {
+            // If tracking just became normal, or if there is a large sudden jump, compensate by rebasing stabilization
+            let becameNormal = (!wasTrackingNormal && isTrackingNormal)
+            let deltaT = distance_squared(lastCam.columns.3, currentRawCam.columns.3)
+            let qa = simd_quatf(lastCam)
+            let qb = simd_quatf(currentRawCam)
+            let rotDelta = acos(min(1.0, max(-1.0, dot(qa.vector, qb.vector)))) * 2.0
+            let largeJump = deltaT > 0.25 || rotDelta > (20.0 * .degreesToRadian) // > 0.5m or > 20 degrees
+            if becameNormal || largeJump {
+                stabilizationTransform = stabilizationTransform * lastCam * simd_inverse(currentRawCam)
+            }
+        }
+        lastRawCameraTransformForStabilization = currentRawCam
+        wasTrackingNormal = isTrackingNormal
+
+        // update frame data (with stabilization)
         update(frame: currentFrame)
         updateCapturedImageTextures(frame: currentFrame)
+        _ = updateDepthTextures(frame: currentFrame)
         
         // handle buffer rotating
         currentBufferIndex = (currentBufferIndex + 1) % maxInFlightBuffers
@@ -251,6 +296,41 @@ final class Renderer {
         renderEncoder.setVertexBuffer(pointCloudUniformsBuffers[currentBufferIndex])
         renderEncoder.setVertexBuffer(particlesBuffer)
         renderEncoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: currentPointCount)
+
+        // decide if we should render meshes this frame (avoid relocalization jumps)
+        let shouldRenderMeshes: Bool
+        switch currentFrame.camera.trackingState {
+        case .normal:
+            shouldRenderMeshes = true
+        default:
+            shouldRenderMeshes = false
+        }
+
+        // take a snapshot of meshes to avoid concurrent mutation while rendering
+        let meshesSnapshot: [(UUID, MeshBuffers)] = meshQueue.sync { Array(self.meshesById) }
+        // meshes are baked to world space, render snapshot as-is
+        let meshesToRender: [MeshBuffers] = shouldRenderMeshes ? meshesSnapshot.map { $0.1 } : []
+
+        // render meshes if any
+        if shouldRenderMeshes && !meshesToRender.isEmpty {
+            renderEncoder.setRenderPipelineState(meshPipelineState)
+            renderEncoder.setCullMode(.none)
+            for mesh in meshesToRender {
+                // Meshes are baked into world coordinates; pass camera mapping for confidence lookup
+                var uniforms = MeshUniforms(viewProjectionMatrix: pointCloudUniforms.viewProjectionMatrix, modelMatrix: mesh.modelMatrix, viewToCamera: matrix_identity_float3x3, viewRatio: Float(viewportSize.width / max(1.0, viewportSize.height)))
+                uniforms.viewToCamera.copy(from: viewToCamera)
+                meshUniformsBuffers[currentBufferIndex][0] = uniforms
+                renderEncoder.setVertexBuffer(meshUniformsBuffers[currentBufferIndex])
+                renderEncoder.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 1) // raw MTLBuffer for mesh vertices
+                // Bind confidence texture for coloring
+                if let confTex = confidenceTexture { renderEncoder.setFragmentTexture(CVMetalTextureGetTexture(confTex), index: Int(kTextureConfidence.rawValue)) }
+                renderEncoder.drawIndexedPrimitives(type: .triangle,
+                                                    indexCount: mesh.indexCount,
+                                                    indexType: mesh.indexType,
+                                                    indexBuffer: mesh.indexBuffer,
+                                                    indexBufferOffset: 0)
+            }
+        }
         renderEncoder.endEncoding()
         
         commandBuffer.present(renderDestination.currentDrawable!)
@@ -389,6 +469,22 @@ final class Renderer {
 // MARK: - Metal Helpers
 
 private extension Renderer {
+    func makeMeshPipelineState() -> MTLRenderPipelineState? {
+        guard let vertexFunction = library.makeFunction(name: "meshVertex"),
+              let fragmentFunction = library.makeFunction(name: "meshFragment") else {
+            return nil
+        }
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = vertexFunction
+        descriptor.fragmentFunction = fragmentFunction
+        descriptor.depthAttachmentPixelFormat = renderDestination.depthStencilPixelFormat
+        descriptor.colorAttachments[0].pixelFormat = renderDestination.colorPixelFormat
+        descriptor.colorAttachments[0].isBlendingEnabled = true
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        return try? device.makeRenderPipelineState(descriptor: descriptor)
+    }
     func makeUnprojectionPipelineState() -> MTLRenderPipelineState? {
         guard let vertexFunction = library.makeFunction(name: "unprojectVertex") else {
             return nil
@@ -502,5 +598,60 @@ private extension Renderer {
         
         let rotationAngle = Float(cameraToDisplayRotation(orientation: orientation)) * .degreesToRadian
         return flipYZ * matrix_float4x4(simd_quaternion(rotationAngle, Float3(0, 0, 1)))
+    }
+}
+
+// MARK: - Mesh management
+
+extension Renderer {
+    func upsert(meshAnchor: ARMeshAnchor) {
+        let geometry = meshAnchor.geometry
+        let vertexCount = geometry.vertices.count
+        
+        // Pack positions into a contiguous float3 buffer
+        let packedPositionsBuffer = device.makeBuffer(length: MemoryLayout<SIMD3<Float>>.stride * vertexCount, options: .storageModeShared)!
+        let dstPositions = packedPositionsBuffer.contents().bindMemory(to: SIMD3<Float>.self, capacity: vertexCount)
+        let srcBase = geometry.vertices.buffer.contents().advanced(by: geometry.vertices.offset)
+        for i in 0..<vertexCount {
+            let src = srcBase.advanced(by: i * geometry.vertices.stride).bindMemory(to: SIMD3<Float>.self, capacity: 1)
+            let local = src.pointee
+            let world = meshAnchor.transform * SIMD4<Float>(local.x, local.y, local.z, 1.0)
+            dstPositions.advanced(by: i).pointee = SIMD3<Float>(world.x, world.y, world.z)
+        }
+        
+        // Copy triangle indices into a contiguous index buffer
+        let face = geometry.faces
+        let indexCount = face.count * face.indexCountPerPrimitive
+        let srcIndexBase = face.buffer.contents()
+        let indexType: MTLIndexType = face.bytesPerIndex == 2 ? .uint16 : .uint32
+        let indexBuffer: MTLBuffer
+        if indexType == .uint16 {
+            let length = indexCount * MemoryLayout<UInt16>.stride
+            indexBuffer = device.makeBuffer(length: length, options: .storageModeShared)!
+            let dst = indexBuffer.contents().bindMemory(to: UInt16.self, capacity: indexCount)
+            let src = srcIndexBase.bindMemory(to: UInt16.self, capacity: indexCount)
+            dst.assign(from: src, count: indexCount)
+        } else {
+            let length = indexCount * MemoryLayout<UInt32>.stride
+            indexBuffer = device.makeBuffer(length: length, options: .storageModeShared)!
+            let dst = indexBuffer.contents().bindMemory(to: UInt32.self, capacity: indexCount)
+            let src = srcIndexBase.bindMemory(to: UInt32.self, capacity: indexCount)
+            dst.assign(from: src, count: indexCount)
+        }
+        
+        let mesh = MeshBuffers(vertexBuffer: packedPositionsBuffer,
+                               indexBuffer: indexBuffer,
+                               indexCount: indexCount,
+                               indexType: indexType,
+                               modelMatrix: matrix_identity_float4x4)
+        meshQueue.async(flags: .barrier) {
+            self.meshesById[meshAnchor.identifier] = mesh
+        }
+    }
+    
+    func removeMesh(anchorIdentifier: UUID) {
+        meshQueue.async(flags: .barrier) {
+            self.meshesById.removeValue(forKey: anchorIdentifier)
+        }
     }
 }

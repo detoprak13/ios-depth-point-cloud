@@ -113,6 +113,9 @@ final class ViewController: UIViewController, ARSessionDelegate {
         // enable the scene depth frame-semantic.
         let configuration = ARWorldTrackingConfiguration()
         configuration.frameSemantics = [.sceneDepth, .smoothedSceneDepth]
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
+            configuration.sceneReconstruction = .meshWithClassification
+        }
         
         // Run the view's session
         session.run(configuration)
@@ -260,4 +263,35 @@ protocol RenderDestinationProvider {
 
 extension MTKView: RenderDestinationProvider {
     
+}
+
+// MARK: - ARSessionDelegate (Mesh Anchors)
+
+extension ViewController {
+    func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
+        for anchor in anchors {
+            if let meshAnchor = anchor as? ARMeshAnchor {
+                renderer.upsert(meshAnchor: meshAnchor)
+                print("upserted mesh anchor: \(meshAnchor.identifier)")
+            }
+        }
+    }
+    
+    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        for anchor in anchors {
+            if let meshAnchor = anchor as? ARMeshAnchor {
+                renderer.upsert(meshAnchor: meshAnchor)
+                print("updated mesh anchor: \(meshAnchor.identifier)")
+            }
+        }
+    }
+    
+    func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+        for anchor in anchors {
+            if let meshAnchor = anchor as? ARMeshAnchor {
+                renderer.removeMesh(anchorIdentifier: meshAnchor.identifier)
+                print("removed mesh anchor: \(meshAnchor.identifier)")
+            }
+        }
+    }
 }
