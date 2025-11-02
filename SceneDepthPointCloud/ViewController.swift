@@ -289,8 +289,8 @@ extension ViewController {
     func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
         for anchor in anchors {
             if let meshAnchor = anchor as? ARMeshAnchor {
-                renderer.removeMesh(anchorIdentifier: meshAnchor.identifier)
-                print("removed mesh anchor: \(meshAnchor.identifier)")
+                renderer.scheduleMeshRemoval(anchorIdentifier: meshAnchor.identifier)
+                print("scheduled removal of mesh anchor: \(meshAnchor.identifier)")
             }
         }
     }

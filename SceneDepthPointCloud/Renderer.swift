@@ -50,6 +50,7 @@ final class Renderer {
     private lazy var rgbPipelineState = makeRGBPipelineState()!
     private lazy var particlePipelineState = makeParticlePipelineState()!
     private lazy var meshPipelineState = makeMeshPipelineState()!
+    private lazy var wirePipelineState = makeWirePipelineState()!
     // texture cache for captured image
     private lazy var textureCache = makeTextureCache()
     private var capturedImageTextureY: CVMetalTexture?
@@ -102,9 +103,28 @@ final class Renderer {
         let indexCount: Int
         let indexType: MTLIndexType
         let modelMatrix: simd_float4x4
+        let boundsCenter: SIMD3<Float>
+        let boundsExtent: SIMD3<Float>
+        let meshId: Int32
+        let edgeIndexBuffer: MTLBuffer
+        let edgeIndexCount: Int
     }
     private var meshesById: [UUID: MeshBuffers] = [:]
     private let meshQueue = DispatchQueue(label: "SceneDepthPointCloud.Renderer.meshQueue", attributes: .concurrent)
+    // Mesh anchors may be temporarily removed by ARKit (e.g., out of view, relocalization).
+    // Defer actual removal to keep last-known meshes for a grace period while tracking stabilizes.
+    private var pendingMeshRemovalIds: Set<UUID> = []
+    // When a new mesh appears close to a previously removed one, treat it as a correction and replace the old one.
+    private let correctionProximityMeters: Float = 0.4
+    
+    // Mesh info buffer for GPU classification
+    private let maxMeshes = 512
+    private var meshInfosBuffer: MetalBuffer<MeshInfo>
+    private var meshVoxelsBuffer: MetalBuffer<UInt32>
+    private var meshIdByUUID: [UUID: Int32] = [:]
+    private var freeMeshIds: [Int32] = []
+    private let voxelResolution: Int32 = 16
+    private let defaultVoxelThreshold: Int32 = 8
     
     // World stabilization to mitigate ARKit world rebases
     private var stabilizationTransform = matrix_identity_float4x4
@@ -159,6 +179,14 @@ final class Renderer {
         depthStencilState = device.makeDepthStencilState(descriptor: depthStateDescriptor)!
         
         inFlightSemaphore = DispatchSemaphore(value: maxInFlightBuffers)
+        // Allocate mesh info buffer
+        meshInfosBuffer = .init(device: device, count: maxMeshes, index: kMeshInfos.rawValue)
+        // Allocate voxel buffer (accumulated over time)
+        let voxelsPerMesh = Int(voxelResolution * voxelResolution * voxelResolution)
+        meshVoxelsBuffer = .init(device: device, count: maxMeshes * voxelsPerMesh, index: kMeshVoxels.rawValue)
+        // Zero initialize
+        let zeroArray = [UInt32](repeating: 0, count: meshVoxelsBuffer.count)
+        meshVoxelsBuffer.assign(with: zeroArray)
     }
     
     func drawRectResized(size: CGSize) {
@@ -199,6 +227,8 @@ final class Renderer {
         pointCloudUniforms.viewProjectionMatrix = projectionMatrix * viewMatrix * simd_inverse(stabilizationTransform)
         pointCloudUniforms.localToWorld = stabilizationTransform * (viewMatrixInversed * rotateToARCamera)
         pointCloudUniforms.cameraIntrinsicsInversed = cameraIntrinsicsInversed
+        pointCloudUniforms.voxelResolution = voxelResolution
+        pointCloudUniforms.voxelThreshold = defaultVoxelThreshold
     }
     
     func draw() {
@@ -244,6 +274,18 @@ final class Renderer {
         update(frame: currentFrame)
         updateCapturedImageTextures(frame: currentFrame)
         _ = updateDepthTextures(frame: currentFrame)
+        
+        // Build compact MeshInfo array snapshot for GPU classification
+        let meshesSnapshot: [(UUID, MeshBuffers)] = meshQueue.sync { Array(self.meshesById) }
+        let meshInfosCount = min(meshesSnapshot.count, maxMeshes)
+        var filled = 0
+        for i in 0..<meshInfosCount {
+            let entry = meshesSnapshot[i].1
+            var info = MeshInfo(center: entry.boundsCenter, extent: entry.boundsExtent, meshId: entry.meshId, _pad: 0)
+            meshInfosBuffer[i] = info
+            filled += 1
+        }
+        pointCloudUniforms.meshCount = Int32(filled)
         
         // handle buffer rotating
         currentBufferIndex = (currentBufferIndex + 1) % maxInFlightBuffers
@@ -307,7 +349,7 @@ final class Renderer {
         }
 
         // take a snapshot of meshes to avoid concurrent mutation while rendering
-        let meshesSnapshot: [(UUID, MeshBuffers)] = meshQueue.sync { Array(self.meshesById) }
+        // (already built earlier for meshInfos)
         // meshes are baked to world space, render snapshot as-is
         let meshesToRender: [MeshBuffers] = shouldRenderMeshes ? meshesSnapshot.map { $0.1 } : []
 
@@ -317,17 +359,29 @@ final class Renderer {
             renderEncoder.setCullMode(.none)
             for mesh in meshesToRender {
                 // Meshes are baked into world coordinates; pass camera mapping for confidence lookup
-                var uniforms = MeshUniforms(viewProjectionMatrix: pointCloudUniforms.viewProjectionMatrix, modelMatrix: mesh.modelMatrix, viewToCamera: matrix_identity_float3x3, viewRatio: Float(viewportSize.width / max(1.0, viewportSize.height)))
+                var uniforms = MeshUniforms(viewProjectionMatrix: pointCloudUniforms.viewProjectionMatrix, modelMatrix: mesh.modelMatrix, viewToCamera: matrix_identity_float3x3, viewRatio: Float(viewportSize.width / max(1.0, viewportSize.height)), meshId: mesh.meshId, boundsCenter: mesh.boundsCenter, boundsExtent: mesh.boundsExtent)
                 uniforms.viewToCamera.copy(from: viewToCamera)
                 meshUniformsBuffers[currentBufferIndex][0] = uniforms
                 renderEncoder.setVertexBuffer(meshUniformsBuffers[currentBufferIndex])
+                renderEncoder.setFragmentBuffer(meshUniformsBuffers[currentBufferIndex])
+                // Provide voxel and global uniforms to fragment for coverage lookup
+                renderEncoder.setFragmentBuffer(pointCloudUniformsBuffers[currentBufferIndex])
+                renderEncoder.setFragmentBuffer(meshVoxelsBuffer)
                 renderEncoder.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 1) // raw MTLBuffer for mesh vertices
-                // Bind confidence texture for coloring
-                if let confTex = confidenceTexture { renderEncoder.setFragmentTexture(CVMetalTextureGetTexture(confTex), index: Int(kTextureConfidence.rawValue)) }
                 renderEncoder.drawIndexedPrimitives(type: .triangle,
                                                     indexCount: mesh.indexCount,
                                                     indexType: mesh.indexType,
                                                     indexBuffer: mesh.indexBuffer,
+                                                    indexBufferOffset: 0)
+                // Wireframe overlay
+                renderEncoder.setRenderPipelineState(wirePipelineState)
+                renderEncoder.setVertexBuffer(meshUniformsBuffers[currentBufferIndex])
+                renderEncoder.setFragmentBuffer(meshUniformsBuffers[currentBufferIndex])
+                renderEncoder.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 1)
+                renderEncoder.drawIndexedPrimitives(type: .line,
+                                                    indexCount: mesh.edgeIndexCount,
+                                                    indexType: .uint32,
+                                                    indexBuffer: mesh.edgeIndexBuffer,
                                                     indexBufferOffset: 0)
             }
         }
@@ -454,6 +508,8 @@ final class Renderer {
         renderEncoder.setVertexBuffer(pointCloudUniformsBuffers[currentBufferIndex])
         renderEncoder.setVertexBuffer(particlesBuffer)
         renderEncoder.setVertexBuffer(gridPointsBuffer)
+        renderEncoder.setVertexBuffer(meshInfosBuffer)
+        renderEncoder.setVertexBuffer(meshVoxelsBuffer)
         renderEncoder.setVertexTexture(CVMetalTextureGetTexture(capturedImageTextureY!), index: Int(kTextureY.rawValue))
         renderEncoder.setVertexTexture(CVMetalTextureGetTexture(capturedImageTextureCbCr!), index: Int(kTextureCbCr.rawValue))
         renderEncoder.setVertexTexture(CVMetalTextureGetTexture(depthTexture!), index: Int(kTextureDepth.rawValue))
@@ -472,6 +528,22 @@ private extension Renderer {
     func makeMeshPipelineState() -> MTLRenderPipelineState? {
         guard let vertexFunction = library.makeFunction(name: "meshVertex"),
               let fragmentFunction = library.makeFunction(name: "meshFragment") else {
+            return nil
+        }
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = vertexFunction
+        descriptor.fragmentFunction = fragmentFunction
+        descriptor.depthAttachmentPixelFormat = renderDestination.depthStencilPixelFormat
+        descriptor.colorAttachments[0].pixelFormat = renderDestination.colorPixelFormat
+        descriptor.colorAttachments[0].isBlendingEnabled = true
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        return try? device.makeRenderPipelineState(descriptor: descriptor)
+    }
+    func makeWirePipelineState() -> MTLRenderPipelineState? {
+        guard let vertexFunction = library.makeFunction(name: "meshVertex"),
+              let fragmentFunction = library.makeFunction(name: "meshWireFragment") else {
             return nil
         }
         let descriptor = MTLRenderPipelineDescriptor()
@@ -612,12 +684,19 @@ extension Renderer {
         let packedPositionsBuffer = device.makeBuffer(length: MemoryLayout<SIMD3<Float>>.stride * vertexCount, options: .storageModeShared)!
         let dstPositions = packedPositionsBuffer.contents().bindMemory(to: SIMD3<Float>.self, capacity: vertexCount)
         let srcBase = geometry.vertices.buffer.contents().advanced(by: geometry.vertices.offset)
+        var minB = SIMD3<Float>(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude)
+        var maxB = SIMD3<Float>(-Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude, -Float.greatestFiniteMagnitude)
         for i in 0..<vertexCount {
             let src = srcBase.advanced(by: i * geometry.vertices.stride).bindMemory(to: SIMD3<Float>.self, capacity: 1)
             let local = src.pointee
             let world = meshAnchor.transform * SIMD4<Float>(local.x, local.y, local.z, 1.0)
             dstPositions.advanced(by: i).pointee = SIMD3<Float>(world.x, world.y, world.z)
+            let w = SIMD3<Float>(world.x, world.y, world.z)
+            minB = SIMD3<Float>(min(minB.x, w.x), min(minB.y, w.y), min(minB.z, w.z))
+            maxB = SIMD3<Float>(max(maxB.x, w.x), max(maxB.y, w.y), max(maxB.z, w.z))
         }
+        let boundsCenter = (minB + maxB) * 0.5
+        let boundsExtent = maxB - minB
         
         // Copy triangle indices into a contiguous index buffer
         let face = geometry.faces
@@ -639,19 +718,124 @@ extension Renderer {
             dst.assign(from: src, count: indexCount)
         }
         
+        let meshId = getOrAssignMeshId(for: meshAnchor.identifier)
+        // Build unique edge index buffer (lines) from triangle faces
+        var edgePairs = Set<UInt64>()
+        func edgeKey(_ a: UInt32, _ b: UInt32) -> UInt64 {
+            let x = min(a, b)
+            let y = max(a, b)
+            return (UInt64(x) << 32) | UInt64(y)
+        }
+        if face.bytesPerIndex == 2 {
+            let triCount = face.count
+            let base = srcIndexBase.bindMemory(to: UInt16.self, capacity: indexCount)
+            for f in 0..<triCount {
+                let i0 = UInt32(base[f * 3 + 0])
+                let i1 = UInt32(base[f * 3 + 1])
+                let i2 = UInt32(base[f * 3 + 2])
+                edgePairs.insert(edgeKey(i0, i1))
+                edgePairs.insert(edgeKey(i1, i2))
+                edgePairs.insert(edgeKey(i2, i0))
+            }
+        } else {
+            let triCount = face.count
+            let base = srcIndexBase.bindMemory(to: UInt32.self, capacity: indexCount)
+            for f in 0..<triCount {
+                let i0 = base[f * 3 + 0]
+                let i1 = base[f * 3 + 1]
+                let i2 = base[f * 3 + 2]
+                edgePairs.insert(edgeKey(i0, i1))
+                edgePairs.insert(edgeKey(i1, i2))
+                edgePairs.insert(edgeKey(i2, i0))
+            }
+        }
+        var lineIndices = [UInt32]()
+        lineIndices.reserveCapacity(edgePairs.count * 2)
+        for k in edgePairs {
+            let a = UInt32(k >> 32)
+            let b = UInt32(k & 0xffffffff)
+            lineIndices.append(a)
+            lineIndices.append(b)
+        }
+        let edgeIndexBuffer = device.makeBuffer(bytes: lineIndices, length: lineIndices.count * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
         let mesh = MeshBuffers(vertexBuffer: packedPositionsBuffer,
                                indexBuffer: indexBuffer,
                                indexCount: indexCount,
                                indexType: indexType,
-                               modelMatrix: matrix_identity_float4x4)
+                               modelMatrix: matrix_identity_float4x4,
+                               boundsCenter: boundsCenter,
+                               boundsExtent: boundsExtent,
+                               meshId: meshId,
+                               edgeIndexBuffer: edgeIndexBuffer,
+                               edgeIndexCount: lineIndices.count)
+        // Resolve any pending old meshes that this new mesh corrects
+        resolveCorrectionsForNewMesh(newCenter: boundsCenter, newExtent: boundsExtent)
         meshQueue.async(flags: .barrier) {
             self.meshesById[meshAnchor.identifier] = mesh
+            // Cancel any pending removal if this anchor resurfaced
+            self.pendingMeshRemovalIds.remove(meshAnchor.identifier)
         }
     }
     
     func removeMesh(anchorIdentifier: UUID) {
         meshQueue.async(flags: .barrier) {
-            self.meshesById.removeValue(forKey: anchorIdentifier)
+            if let removed = self.meshesById.removeValue(forKey: anchorIdentifier) {
+                // free mesh id for reuse
+                self.freeMeshIds.append(removed.meshId)
+                self.meshIdByUUID.removeValue(forKey: anchorIdentifier)
+            }
         }
+    }
+
+    /// Schedule a mesh for deferred removal. The mesh will remain rendered until
+    /// tracking has been stable for several frames and the grace period has elapsed.
+    func scheduleMeshRemoval(anchorIdentifier: UUID) {
+        meshQueue.async(flags: .barrier) {
+            // Only schedule if it still exists; otherwise ignore
+            if self.meshesById[anchorIdentifier] != nil {
+                self.pendingMeshRemovalIds.insert(anchorIdentifier)
+            }
+        }
+    }
+    
+    /// Remove pending meshes that are likely being corrected by a newly added/updated mesh nearby.
+    private func resolveCorrectionsForNewMesh(newCenter: SIMD3<Float>, newExtent: SIMD3<Float>) {
+        let candidates: [UUID] = meshQueue.sync { Array(self.pendingMeshRemovalIds) }
+        guard !candidates.isEmpty else { return }
+        let halfMaxExtent = max(newExtent.x, max(newExtent.y, newExtent.z)) * 0.5
+        let threshold = halfMaxExtent + correctionProximityMeters
+        let threshold2 = threshold * threshold
+        var idsToRemove: [UUID] = []
+        meshQueue.sync {
+            for id in candidates {
+                if let old = self.meshesById[id] {
+                    let dx = old.boundsCenter.x - newCenter.x
+                    let dy = old.boundsCenter.y - newCenter.y
+                    let dz = old.boundsCenter.z - newCenter.z
+                    let d2 = dx*dx + dy*dy + dz*dz
+                    if d2 <= threshold2 {
+                        idsToRemove.append(id)
+                    }
+                }
+            }
+        }
+        if idsToRemove.isEmpty { return }
+        meshQueue.async(flags: .barrier) {
+            for id in idsToRemove {
+                self.pendingMeshRemovalIds.remove(id)
+                if let removed = self.meshesById.removeValue(forKey: id) {
+                    self.freeMeshIds.append(removed.meshId)
+                    self.meshIdByUUID.removeValue(forKey: id)
+                }
+            }
+        }
+    }
+
+    private func getOrAssignMeshId(for uuid: UUID) -> Int32 {
+        if let id = meshIdByUUID[uuid] { return id }
+        let id: Int32
+        if let reused = freeMeshIds.popLast() { id = reused } else { id = Int32(meshIdByUUID.count) }
+        meshIdByUUID[uuid] = id
+        return id
     }
 }

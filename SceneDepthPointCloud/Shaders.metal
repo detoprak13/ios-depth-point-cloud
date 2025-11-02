@@ -23,6 +23,7 @@ struct ParticleVertexOut {
     float pointSize [[point_size]];
     float4 color;
     float confidence;
+    int meshId;
 };
 
 constexpr sampler colorSampler(mip_filter::linear, mag_filter::linear, min_filter::linear);
@@ -46,6 +47,8 @@ vertex void unprojectVertex(uint vertexID [[vertex_id]],
                             constant PointCloudUniforms &uniforms [[buffer(kPointCloudUniforms)]],
                             device ParticleUniforms *particleUniforms [[buffer(kParticleUniforms)]],
                             constant float2 *gridPoints [[buffer(kGridPoints)]],
+                            const device MeshInfo *meshInfos [[buffer(kMeshInfos)]],
+                            device atomic_uint *meshVoxels [[buffer(kMeshVoxels)]],
                             texture2d<float, access::sample> capturedImageTextureY [[texture(kTextureY)]],
                             texture2d<float, access::sample> capturedImageTextureCbCr [[texture(kTextureCbCr)]],
                             texture2d<float, access::sample> depthTexture [[texture(kTextureDepth)]],
@@ -65,10 +68,57 @@ vertex void unprojectVertex(uint vertexID [[vertex_id]],
     // Sample the confidence map to get the confidence value
     const auto confidence = confidenceTexture.sample(colorSampler, texCoord).r;
     
+    // Classify point to a mesh via AABB proximity
+    int bestMesh = -1;
+    float bestD2 = INFINITY;
+    const float margin = 0.03; // 3cm tolerance
+    for (int i = 0; i < uniforms.meshCount; ++i) {
+        const float3 c = meshInfos[i].center;
+        const float3 e = meshInfos[i].extent * 0.5 + float3(margin);
+        const float3 p = position.xyz;
+        const bool inside = (p.x >= c.x - e.x) && (p.x <= c.x + e.x)
+                         && (p.y >= c.y - e.y) && (p.y <= c.y + e.y)
+                         && (p.z >= c.z - e.z) && (p.z <= c.z + e.z);
+        if (inside) {
+            const float3 d = p - c;
+            const float d2 = dot(d, d);
+            if (d2 < bestD2) {
+                bestD2 = d2;
+                bestMesh = meshInfos[i].meshId;
+            }
+        }
+    }
+
+    // If classified and confidence ok, accumulate into per-mesh voxel grid
+    if (bestMesh >= 0 && confidence >= 1.0 && uniforms.voxelResolution > 0) {
+        // Find the matching MeshInfo by meshId to retrieve its bounds
+        // Note: meshId is dense [0..N), so index by id if it matches order; otherwise linear search
+        int r = uniforms.voxelResolution;
+        int voxelsPerMesh = r * r * r;
+        int meshIndex = -1;
+        for (int i = 0; i < uniforms.meshCount; ++i) {
+            if (meshInfos[i].meshId == bestMesh) { meshIndex = i; break; }
+        }
+        if (meshIndex >= 0) {
+            const float3 c = meshInfos[meshIndex].center;
+            const float3 ext = max(meshInfos[meshIndex].extent * 0.5, float3(0.05)); // clamp to avoid zero extent
+            const float3 p = position.xyz;
+            float3 t = saturate((p - (c - ext)) / max(ext * 2.0, float3(1e-3)));
+            // Map to voxel coords [0..r-1]
+            int ix = min(r - 1, int(t.x * r));
+            int iy = min(r - 1, int(t.y * r));
+            int iz = min(r - 1, int(t.z * r));
+            int base = bestMesh * voxelsPerMesh;
+            int idx = base + (iz * r + iy) * r + ix;
+            atomic_fetch_add_explicit(&meshVoxels[idx], 1, memory_order_relaxed);
+        }
+    }
+
     // Write the data to the buffer
     particleUniforms[currentPointIndex].position = position.xyz;
     particleUniforms[currentPointIndex].color = sampledColor;
     particleUniforms[currentPointIndex].confidence = confidence;
+    particleUniforms[currentPointIndex].meshId = bestMesh;
 }
 
 vertex RGBVertexOut rgbVertex(uint vertexID [[vertex_id]],
@@ -118,7 +168,18 @@ vertex ParticleVertexOut particleVertex(uint vertexID [[vertex_id]],
     out.pointSize = pointSize;
     out.color = float4(sampledColor, visibility);
     out.confidence = confidence;
+    out.meshId = particleData.meshId;
     return out;
+}
+
+static inline float3 colorFromMeshId(int meshId) {
+    // Simple hash -> color mapping (pastel-like)
+    uint h = uint(meshId * 747796405u + 2891336453u);
+    float r = float((h >> 16) & 255u) / 255.0;
+    float g = float((h >> 8) & 255u) / 255.0;
+    float b = float(h & 255u) / 255.0;
+    // mix with white for pastel
+    return mix(float3(r, g, b), float3(1.0, 1.0, 1.0), 0.35);
 }
 
 fragment float4 particleFragment(ParticleVertexOut in [[stage_in]],
@@ -128,17 +189,13 @@ fragment float4 particleFragment(ParticleVertexOut in [[stage_in]],
     if (in.color.a == 0 || distSquared > 0.25) {
         discard_fragment();
     }
-    // Use confidence to determine color
-    // confidence: 2 = high (green), 1 = medium (yellow), 0 = low (discard)
+    // Discard low confidence points
     if (in.confidence < 1.0) {
         discard_fragment(); // low confidence
-    } else if (in.confidence < 2.0) {
-        // medium confidence: yellow
-        return float4(1.0, 1.0, 0.0, 0.5);
-    } else {
-        // high confidence: green
-        return float4(0.0, 1.0, 0.0, 0.5);
     }
+    // Color by mesh membership if available; otherwise neutral
+    float3 col = (in.meshId >= 0) ? colorFromMeshId(in.meshId) : float3(0.6, 0.6, 0.6);
+    return float4(col, 0.6);
 }
 
 // MARK: - Mesh rendering
@@ -147,6 +204,7 @@ struct MeshVertexOut {
     float4 position [[position]];
     float3 color;
     float2 texCoord; // screen-space UV mapped to camera
+    float3 worldPos;
 };
 
 vertex MeshVertexOut meshVertex(uint vertexID [[vertex_id]],
@@ -157,6 +215,7 @@ vertex MeshVertexOut meshVertex(uint vertexID [[vertex_id]],
     float4 world = uniforms.modelMatrix * float4(pos, 1.0);
     float4 clip = uniforms.viewProjectionMatrix * world;
     out.position = clip;
+    out.worldPos = world.xyz;
     float2 view01 = (clip.xy / max(clip.w, 1e-6)) * float2(0.5, -0.5) + float2(0.5, 0.5);
     // map to camera texcoords using the same transform as RGB path
     float3 cam = float3(view01, 1) * uniforms.viewToCamera;
@@ -166,15 +225,29 @@ vertex MeshVertexOut meshVertex(uint vertexID [[vertex_id]],
 }
 
 fragment float4 meshFragment(MeshVertexOut in [[stage_in]],
-                             texture2d<unsigned int, access::sample> confidenceTexture [[texture(kTextureConfidence)]]) {
-    constexpr sampler s(mip_filter::nearest, mag_filter::nearest, min_filter::nearest, address::clamp_to_edge);
-    float2 uv = in.texCoord;
-    float conf = confidenceTexture.sample(s, uv).r;
-    // Map: 0=discard, 1=yellow, 2=green
-    if (conf < 1.0) discard_fragment();
-    float3 low = float3(1.0, 1.0, 0.0);
-    float3 high = float3(0.0, 1.0, 0.0);
-    float t = saturate((conf - 1.0) / 1.0);
-    float3 col = mix(low, high, t);
-    return float4(col, 0.6);
+                             constant MeshUniforms &uniforms [[buffer(kMeshUniforms)]],
+                             constant PointCloudUniforms &pc [[buffer(kPointCloudUniforms)]],
+                             const device uint *meshVoxels [[buffer(kMeshVoxels)]]) {
+    // Default color by meshId
+    float3 baseCol = colorFromMeshId(uniforms.meshId);
+    int r = max(1, pc.voxelResolution);
+    int voxelsPerMesh = r * r * r;
+    // Compute voxel index using mesh bounds
+    float3 ext = max(uniforms.boundsExtent * 0.5, float3(0.05));
+    float3 t = saturate((in.worldPos - (uniforms.boundsCenter - ext)) / max(ext * 2.0, float3(1e-3)));
+    int ix = min(r - 1, int(t.x * r));
+    int iy = min(r - 1, int(t.y * r));
+    int iz = min(r - 1, int(t.z * r));
+    int base = uniforms.meshId * voxelsPerMesh;
+    int idx = base + (iz * r + iy) * r + ix;
+    uint count = meshVoxels[idx];
+    bool covered = (int(count) >= pc.voxelThreshold);
+    float3 col = covered ? baseCol : mix(baseCol, float3(0.2,0.2,0.2), 0.65);
+    return float4(col, covered ? 0.6 : 0.25);
+}
+
+// Faint wireframe overlay for mesh borders
+fragment float4 meshWireFragment(MeshVertexOut in [[stage_in]]) {
+    // subtle dark edge
+    return float4(0.0, 0.0, 0.0, 0.25);
 }
